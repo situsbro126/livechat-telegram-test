@@ -1,65 +1,66 @@
-# LiveChat ↔ Telegram Bridge V2 FAST
+# LiveChat ↔ Telegram Bridge v2.5 — Canned File
 
-Versi ini adalah build terbaru untuk workflow berikut:
+V2.5 keeps the V2.4 race/recovery fixes and adds canned responses from a JSON file.
 
-- Pre-chat form `Nama + Kendala` langsung membuat Topic Telegram tanpa menunggu member mengetik.
-- Hanya chat/thread LiveChat yang aktif yang diproses.
-- History lama dan End Chat tidak dibuat ulang menjadi topic.
-- 1 customer memakai topic lamanya kembali bila mapping historis tersedia.
-- End Chat menutup Topic Telegram, bukan menghapus history.
-- Saat member kembali, Topic lama dibuka kembali.
-- Jika Topic dihapus manual, bridge mencoba membuat Topic pengganti saat member aktif lagi.
-- Balasan operator dari Telegram dikirim ke LiveChat.
-- Tombol `End Chat`, `/close`, dan `/end` menutup LiveChat dari Telegram.
-- Polling default 2 detik agar pesan terasa lebih live.
-- Bila LiveChat memberi rate-limit, bridge melakukan backoff otomatis sementara hingga maksimal 15 detik.
-- Anti-spam membatasi pembuatan topic baru per polling.
+## Canned response commands in Telegram
 
-## File yang diupload ke GitHub
+- `#` or `/canned` — show quick-reply menu (first 20 matches)
+- `#depo` — immediately send canned response `depo` to the active LiveChat
+- `#cari bonus` — search canned shortcuts/text containing `bonus`
+- LiveChat shortcuts containing spaces are normalized with underscores, e.g. `share fb` → `#share_fb`
 
-Upload hanya:
+## Recommended setup on Render
 
-- `server.js`
-- `package.json`
-- `README.md`
-- `env.example`
-- `.gitignore`
+Do **not** put your real canned responses in a public GitHub repo.
 
-Jangan upload `.env` atau token asli.
+1. Render → your Web Service → **Environment**.
+2. Under **Secret Files**, add a file named `canned.json`.
+3. Paste the contents of the generated `canned.json` into that secret file.
+4. Save/redeploy.
 
-## Render Environment Variables
+Render exposes the file at `/etc/secrets/canned.json`. The bridge detects that path automatically.
 
-Wajib:
+## Required Environment Variables
 
-```text
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_GROUP_ID=-100...
-TELEGRAM_WEBHOOK_SECRET=...
-PUBLIC_BASE_URL=https://livechat-telegram-test.onrender.com
-LIVECHAT_ACCESS_TOKEN=...
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_GROUP_ID`
+- `TELEGRAM_WEBHOOK_SECRET`
+- `PUBLIC_BASE_URL`
+- `LIVECHAT_ACCESS_TOKEN`
+
+Recommended:
+
+- `LIVECHAT_POLL_SECONDS=2`
+- `MAX_NEW_TOPICS_PER_POLL=3`
+- `BOOTSTRAP_SCAN_PAGES=5`
+
+No `CANNED_RESPONSES_JSON` is needed when the secret file exists.
+
+## Supported canned.json shapes
+
+The bridge accepts either:
+
+```json
+{
+  "depo": "Deposit kakak sudah kami proses ya."
+}
 ```
 
-Disarankan:
+or a LiveChat-style array:
 
-```text
-LIVECHAT_POLL_SECONDS=2
-MAX_NEW_TOPICS_PER_POLL=3
-BOOTSTRAP_SCAN_PAGES=5
+```json
+[
+  {"text":"Deposit kakak sudah kami proses ya.","tags":["depo","dpo"]}
+]
 ```
 
-Untuk `LIVECHAT_ACCESS_TOKEN`, gunakan Base64 Encoded Token dari PAT LiveChat dengan scope `chats--access:rw`.
+## Existing workflow retained
 
-## Test
-
-1. Deploy dan tunggu Render `Live`.
-2. Buka URL service. Status harus `READY`.
-3. Isi pre-chat form sebagai member baru.
-4. Setelah klik Mulai Obrolan, Topic Telegram harus muncul kira-kira dalam 1–3 detik saat service sedang aktif.
-5. Kirim pesan member. Pesan masuk ke topic yang sama.
-6. Balas di Telegram. Balasan muncul di LiveChat.
-7. Tekan `End Chat`. Topic ditutup dan history tetap ada.
-8. Saat member kembali, topic lama akan dicoba dibuka kembali.
-
-## Catatan Render Free
-
-Render Free dapat spin down bila tidak menerima traffic masuk selama periode idle. Saat service sedang tidur, pesan tidak akan diproses sampai service bangun kembali. Untuk operasional CS yang harus selalu responsif, gunakan instance Render yang always-on setelah testing selesai.
+- Pre-chat Nama + Kendala can create/reopen the Telegram topic.
+- Only active chats are routed.
+- Old/closed chat history is not replayed as new topics.
+- Telegram reply → LiveChat.
+- End Chat closes the Telegram topic.
+- Returning member reopens prior topic when mapping is available.
+- Deleted/invalid Telegram topic can recover to a new topic.
+- Reply race during polling is handled.

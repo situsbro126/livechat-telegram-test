@@ -1,6 +1,8 @@
 'use strict';
 
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -15,6 +17,63 @@ const BASE_POLL_MS = Math.max(1000, Math.min(10000, Number(process.env.LIVECHAT_
 let currentPollMs = BASE_POLL_MS;
 const MAX_NEW_TOPICS_PER_POLL = Math.max(1, Number(process.env.MAX_NEW_TOPICS_PER_POLL || 3));
 const BOOTSTRAP_SCAN_PAGES = Math.max(1, Math.min(10, Number(process.env.BOOTSTRAP_SCAN_PAGES || 5)));
+
+const CANNED_RAW = String(process.env.CANNED_RESPONSES_JSON || '').trim();
+const CANNED_FILE = String(process.env.CANNED_FILE || '').trim() ||
+  (fs.existsSync('/etc/secrets/canned.json') ? '/etc/secrets/canned.json' : path.join(__dirname, 'canned.json'));
+
+function normalizeCannedCode(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^#+/, '')
+    .toLowerCase()
+    .replace(/\s+/g, '_')
+    .replace(/[^a-z0-9_-]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+function addCanned(target, code, text) {
+  const key = normalizeCannedCode(code);
+  const value = String(text ?? '').trim();
+  if (key && value) target[key] = value;
+}
+
+function ingestCanned(target, parsed) {
+  if (!parsed) return;
+  if (Array.isArray(parsed)) {
+    for (const item of parsed) {
+      const text = String(item?.text ?? item?.response ?? '').trim();
+      const tags = Array.isArray(item?.tags) ? item.tags : [item?.tag ?? item?.shortcut ?? item?.code];
+      for (const tag of tags) addCanned(target, tag, text);
+    }
+    return;
+  }
+  if (typeof parsed === 'object') {
+    if (Array.isArray(parsed.responses)) return ingestCanned(target, parsed.responses);
+    for (const [key, value] of Object.entries(parsed)) addCanned(target, key, value);
+  }
+}
+
+function loadCannedResponses() {
+  const result = {};
+  try {
+    if (fs.existsSync(CANNED_FILE)) {
+      ingestCanned(result, JSON.parse(fs.readFileSync(CANNED_FILE, 'utf8')));
+      console.log(`[bridge] canned file loaded: ${Object.keys(result).length} shortcut(s) from ${CANNED_FILE}`);
+    }
+  } catch (err) {
+    console.warn('[bridge] canned file invalid:', err.message);
+  }
+  try {
+    if (CANNED_RAW) ingestCanned(result, JSON.parse(CANNED_RAW));
+  } catch (err) {
+    console.warn('[bridge] CANNED_RESPONSES_JSON invalid JSON:', err.message);
+  }
+  return result;
+}
+
+const CANNED_RESPONSES = loadCannedResponses();
 
 const LC_BASE = 'https://api.livechatinc.com/v3.5/agent/action';
 const TG_BASE = TG_TOKEN ? `https://api.telegram.org/bot${TG_TOKEN}` : '';
@@ -40,6 +99,7 @@ const stats = {
   topicsReopened: 0,
   topicsClosed: 0,
   bootstrapMappings: 0,
+  cannedSent: 0,
 };
 
 let pollRunning = false;
@@ -327,11 +387,15 @@ function isMissingTopicError(err) {
 }
 
 async function recoverDeletedTopic(marker, chatId, name, issue = '') {
+  const oldTopicId = Number(marker.t);
   const topic = await tgCall('createForumTopic', {
     chat_id: TG_GROUP_ID,
     name: topicName(name, true, issue),
   });
   marker.t = Number(topic.message_thread_id);
+  if (oldTopicId && oldTopicId !== marker.t) {
+    topicToActiveChat.delete(String(oldTopicId));
+  }
   marker.s = 'o';
   await saveMarker(chatId, marker);
   historicalByCustomer.set(marker.c, marker);
@@ -608,8 +672,14 @@ async function pollOnce() {
     // Build historical cache before active processing so new chat_ids can reuse topics.
     for (const chat of chats) rememberHistorical(chat);
 
-    // Rebuild active topic routing on every poll.
-    topicToActiveChat.clear();
+    // Keep the previous routing map alive while polling. Clearing it here caused
+    // a race where the first Telegram reply could arrive during a poll and see
+    // an empty map. We only remove stale routes after the active chats finish.
+    const activeChatIds = new Set(
+      chats
+        .filter(c => c?.last_thread_summary?.active === true)
+        .map(c => String(c.id))
+    );
     let topicBudget = MAX_NEW_TOPICS_PER_POLL;
 
     for (const summary of chats) {
@@ -624,6 +694,15 @@ async function pollOnce() {
     }
 
     await syncClosedChats(chats);
+
+    // Remove routes whose LiveChat is no longer active, but only after the new
+    // routes have been built. This keeps replies working continuously during polls.
+    for (const [topicId, chatId] of topicToActiveChat.entries()) {
+      if (!activeChatIds.has(String(chatId))) {
+        topicToActiveChat.delete(topicId);
+      }
+    }
+
     // Kembali ke interval cepat setelah polling sukses.
     currentPollMs = BASE_POLL_MS;
   } catch (err) {
@@ -635,13 +714,101 @@ async function pollOnce() {
   }
 }
 
-async function sendTelegramReplyToLiveChat(topicId, text) {
-  let chatId = topicToActiveChat.get(String(topicId));
-  if (!chatId) {
-    // Do a quick refresh once; useful right after a Render restart.
-    await pollOnce();
-    chatId = topicToActiveChat.get(String(topicId));
+async function waitForPollToFinish(maxMs = 3500) {
+  const started = Date.now();
+  while (pollRunning && Date.now() - started < maxMs) {
+    await sleep(75);
   }
+}
+
+async function resolveActiveChatForTopic(topicId) {
+  const key = String(topicId);
+  let chatId = topicToActiveChat.get(key);
+  if (chatId) return chatId;
+
+  // If a scheduled poll is currently rebuilding mappings, wait for it instead
+  // of immediately failing the first Telegram reply.
+  if (pollRunning) {
+    await waitForPollToFinish();
+    chatId = topicToActiveChat.get(key);
+    if (chatId) return chatId;
+  }
+
+  // Durable fallback: find the topic id in LiveChat chat properties. This makes
+  // replies work immediately after deploy/restart even before the normal poll
+  // has populated the runtime cache.
+  const chats = await listChatsPages(1);
+  for (const summary of chats) {
+    if (summary?.last_thread_summary?.active !== true) continue;
+    const marker = decodeMarker(summary);
+    if (marker && String(marker.t) === key) {
+      topicToActiveChat.set(key, summary.id);
+      return summary.id;
+    }
+  }
+
+  // One normal refresh as a last attempt.
+  await pollOnce();
+  return topicToActiveChat.get(key) || null;
+}
+
+
+function cannedCodes() {
+  return Object.keys(CANNED_RESPONSES).sort((a, b) => a.localeCompare(b));
+}
+
+function cannedButtons(codes, max = 20) {
+  const selected = codes.slice(0, max);
+  const rows = [];
+  for (let i = 0; i < selected.length; i += 2) {
+    rows.push(selected.slice(i, i + 2).map(code => ({
+      text: `#${code}`,
+      callback_data: `canned:${code}`,
+    })));
+  }
+  return rows;
+}
+
+async function showCannedMenu(topicId, query = '') {
+  const q = normalizeCannedCode(query);
+  const all = cannedCodes();
+  const matches = q ? all.filter(code => code.includes(q) || CANNED_RESPONSES[code].toLowerCase().includes(q.replace(/_/g, ' '))) : all;
+  if (matches.length === 0) {
+    await tgCall('sendMessage', {
+      chat_id: TG_GROUP_ID,
+      message_thread_id: topicId,
+      text: q
+        ? `Tidak ada canned response yang cocok dengan #${q}.`
+        : 'Canned response belum dikonfigurasi.',
+    });
+    return;
+  }
+  const visible = matches.slice(0, 20);
+  const more = matches.length > visible.length ? `\n…dan ${matches.length - visible.length} lainnya.` : '';
+  await tgCall('sendMessage', {
+    chat_id: TG_GROUP_ID,
+    message_thread_id: topicId,
+    text: `⚡ Quick Replies\n${visible.map(code => `#${code}`).join('  ')}${more}`,
+    reply_markup: { inline_keyboard: cannedButtons(visible) },
+  });
+}
+
+async function sendCannedToLiveChat(topicId, code) {
+  const key = normalizeCannedCode(code);
+  const text = CANNED_RESPONSES[key];
+  if (!text) return false;
+  await sendTelegramReplyToLiveChat(topicId, text);
+  stats.cannedSent += 1;
+  await tgCall('sendMessage', {
+    chat_id: TG_GROUP_ID,
+    message_thread_id: topicId,
+    text: `⚡ #${key}\n${text}`,
+  });
+  return true;
+}
+
+async function sendTelegramReplyToLiveChat(topicId, text) {
+  const chatId = await resolveActiveChatForTopic(topicId);
   if (!chatId) {
     throw new Error('Topic ini tidak sedang terhubung ke LiveChat aktif. Tunggu member chat lagi.');
   }
@@ -653,11 +820,7 @@ async function sendTelegramReplyToLiveChat(topicId, text) {
 }
 
 async function endChatFromTelegram(topicId, requestedChatId = null) {
-  let chatId = requestedChatId || topicToActiveChat.get(String(topicId));
-  if (!chatId) {
-    await pollOnce();
-    chatId = requestedChatId || topicToActiveChat.get(String(topicId));
-  }
+  const chatId = requestedChatId || await resolveActiveChatForTopic(topicId);
   if (!chatId) throw new Error('Tidak menemukan LiveChat aktif untuk topic ini.');
 
   await lcCall('deactivate_chat', {
@@ -715,6 +878,22 @@ app.post('/telegram/webhook', async (req, res) => {
             text: `⚠️ Gagal End Chat: ${compactError(err)}`,
           });
         }
+      } else if (data.startsWith('canned:')) {
+        const code = data.slice(7);
+        try {
+          const sent = await sendCannedToLiveChat(topicId, code);
+          await tgCall('answerCallbackQuery', {
+            callback_query_id: q.id,
+            text: sent ? `#${code} dikirim` : `#${code} tidak ditemukan`,
+          });
+        } catch (err) {
+          await tgCall('answerCallbackQuery', { callback_query_id: q.id, text: 'Gagal mengirim' });
+          await tgCall('sendMessage', {
+            chat_id: TG_GROUP_ID,
+            message_thread_id: topicId,
+            text: `⚠️ Canned response gagal: ${compactError(err)}`,
+          });
+        }
       }
       return;
     }
@@ -736,6 +915,39 @@ app.post('/telegram/webhook', async (req, res) => {
           message_thread_id: msg.message_thread_id,
           text: `⚠️ ${compactError(err)}`,
         });
+      }
+      return;
+    }
+
+    if (text === '/canned' || text === '#') {
+      await showCannedMenu(msg.message_thread_id);
+      return;
+    }
+
+    if (text.toLowerCase().startsWith('#cari ') || text.toLowerCase().startsWith('/cari ')) {
+      const query = text.replace(/^#cari\s+|^\/cari\s+/i, '');
+      await showCannedMenu(msg.message_thread_id, query);
+      return;
+    }
+
+    if (text.startsWith('#')) {
+      const code = normalizeCannedCode(text.slice(1));
+      if (!code) {
+        await showCannedMenu(msg.message_thread_id);
+        return;
+      }
+      if (CANNED_RESPONSES[code]) {
+        try {
+          await sendCannedToLiveChat(msg.message_thread_id, code);
+        } catch (err) {
+          await tgCall('sendMessage', {
+            chat_id: TG_GROUP_ID,
+            message_thread_id: msg.message_thread_id,
+            text: `⚠️ Canned response gagal: ${compactError(err)}`,
+          });
+        }
+      } else {
+        await showCannedMenu(msg.message_thread_id, code);
       }
       return;
     }
@@ -766,6 +978,9 @@ app.get('/health', (req, res) => {
     current_poll_seconds: currentPollMs / 1000,
     active_topic_routes: topicToActiveChat.size,
     historical_customer_topics: historicalByCustomer.size,
+    canned_responses: cannedCodes().length,
+    canned_codes: cannedCodes(),
+    canned_file: CANNED_FILE,
     stats,
   });
 });
@@ -775,9 +990,9 @@ app.get('/', (req, res) => {
   const good = configured();
   res.type('html').send(`<!doctype html>
 <html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LiveChat ↔ Telegram Bridge v2.2 Recovery</title>
+<title>LiveChat ↔ Telegram Bridge v2.5 Canned File</title>
 <style>body{font-family:system-ui,-apple-system,sans-serif;max-width:850px;margin:40px auto;padding:0 18px;background:#0f1115;color:#e9edf1} .card{background:#181c23;border:1px solid #2b313b;border-radius:16px;padding:22px;margin:14px 0} .ok{color:#75e69b}.bad{color:#ff8d8d} code{background:#0b0d10;padding:2px 7px;border-radius:6px} h1{font-size:25px} table{width:100%;border-collapse:collapse}td{padding:7px 0;border-bottom:1px solid #252a32}td:first-child{color:#9fa9b6}</style></head>
-<body><h1>LiveChat ↔ Telegram Bridge v2.2 Recovery</h1>
+<body><h1>LiveChat ↔ Telegram Bridge v2.5 Canned File</h1>
 <div class="card"><b class="${good ? 'ok' : 'bad'}">${good ? '● READY' : '● BELUM LENGKAP'}</b><p>Workflow: selesai isi pre-chat form → topic Telegram langsung dibuat (Nama + Kendala) → pesan baru dipantau cepat → reply Telegram → LiveChat → End Chat menutup topic → member kembali membuka topic lama.</p></div>
 <div class="card"><table>
 <tr><td>Telegram</td><td>${TG_TOKEN && TG_GROUP_ID ? 'configured' : 'missing'}</td></tr>
@@ -790,11 +1005,13 @@ app.get('/', (req, res) => {
 <tr><td>Mapping customer</td><td>${historicalByCustomer.size}</td></tr>
 <tr><td>Pesan member diteruskan</td><td>${stats.forwardedEvents}</td></tr>
 <tr><td>Balasan Telegram → LiveChat</td><td>${stats.telegramRepliesSent}</td></tr>
+<tr><td>Canned responses</td><td>${cannedCodes().length}</td></tr>
+<tr><td>Canned terkirim</td><td>${stats.cannedSent}</td></tr>
 <tr><td>Topic dibuat / reopen / close</td><td>${stats.topicsCreated} / ${stats.topicsReopened} / ${stats.topicsClosed}</td></tr>
 <tr><td>Last poll</td><td>${esc(stats.lastPollAt || '-')}</td></tr>
 <tr><td>Error poll</td><td>${esc(stats.lastPollError || '-')}</td></tr>
 </table></div>
-<div class="card"><b>Anti-spam aktif</b><p>Chat lama/End Chat tidak membuat topic. Pre-chat form baru (Nama + Kendala) sudah cukup untuk membuat topic, jadi member tidak perlu mengetik pesan dulu. Saat server baru deploy, history lama tetap diabaikan. Maksimal ${MAX_NEW_TOPICS_PER_POLL} topic baru per polling. Polling default ${BASE_POLL_MS / 1000} detik dan otomatis melambat sementara jika LiveChat memberi rate-limit.</p><p>Command Telegram: <code>/close</code> atau <code>/end</code> untuk End Chat.</p></div>
+<div class="card"><b>Anti-spam aktif</b><p>Chat lama/End Chat tidak membuat topic. Pre-chat form baru (Nama + Kendala) sudah cukup untuk membuat topic, jadi member tidak perlu mengetik pesan dulu. Saat server baru deploy, history lama tetap diabaikan. Maksimal ${MAX_NEW_TOPICS_PER_POLL} topic baru per polling. Polling default ${BASE_POLL_MS / 1000} detik dan otomatis melambat sementara jika LiveChat memberi rate-limit.</p><p>Command Telegram: <code>/close</code> atau <code>/end</code> untuk End Chat. Ketik <code>#</code> atau <code>/canned</code> untuk daftar quick reply; ketik <code>#kode</code> untuk langsung mengirim canned response, atau <code>#cari bonus</code> untuk mencari shortcut.</p></div>
 </body></html>`);
 });
 
