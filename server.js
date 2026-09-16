@@ -155,9 +155,57 @@ function customerName(customer) {
   return `Member ${String(customer?.id || 'unknown').slice(0, 8)}`;
 }
 
-function topicName(name, open = true) {
-  const clean = String(name || 'Member').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
-  return `${open ? '🟢' : '🔴'} ${clean}`.slice(0, 128);
+function cleanOneLine(value) {
+  return String(value ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function answerText(field) {
+  if (!field) return '';
+  const answer = field.answer;
+  if (typeof answer === 'string' || typeof answer === 'number') return cleanOneLine(answer);
+  if (answer && typeof answer === 'object') {
+    if (answer.label != null) return cleanOneLine(answer.label);
+    if (answer.value != null) return cleanOneLine(answer.value);
+  }
+  if (Array.isArray(field.answers)) {
+    return field.answers.map(a => cleanOneLine(a?.label ?? a?.value ?? a)).filter(Boolean).join(', ');
+  }
+  return '';
+}
+
+function isPrechatFilledForm(event) {
+  if (!event || event.type !== 'filled_form') return false;
+  const formType = String(event.form_type || '').toLowerCase().replace(/[_-]/g, '');
+  if (formType === 'prechat') return true;
+  const labels = (event.fields || []).map(f => String(f?.label || '').toLowerCase());
+  return labels.some(l => /nama|name/.test(l)) && labels.some(l => /kendala|purpose|subject|issue/.test(l));
+}
+
+function prechatDataFromThread(thread) {
+  const forms = (thread?.events || []).filter(isPrechatFilledForm);
+  const event = forms.sort((a, b) => Date.parse(a.created_at || 0) - Date.parse(b.created_at || 0)).at(-1) || null;
+  if (!event) return { event: null, name: '', issue: '', fields: [] };
+
+  const fields = (event.fields || []).map(f => ({
+    label: cleanOneLine(f?.label || f?.type || 'Field'),
+    type: String(f?.type || ''),
+    value: answerText(f),
+  })).filter(f => f.value);
+
+  let name = '';
+  let issue = '';
+  for (const f of fields) {
+    const label = f.label.toLowerCase();
+    if (!name && (f.type === 'name' || /(^|\b)(nama|name)(\b|:)/i.test(f.label))) name = f.value;
+    if (!issue && (/kendala|purpose|subject|issue/i.test(f.label) || ['radio', 'select', 'subject'].includes(f.type))) issue = f.value;
+  }
+  return { event, name, issue, fields };
+}
+
+function topicName(name, open = true, issue = '') {
+  const clean = cleanOneLine(name || 'Member');
+  const suffix = cleanOneLine(issue) ? ` • ${cleanOneLine(issue)}` : '';
+  return `${open ? '🟢' : '🔴'} ${clean}${suffix}`.slice(0, 128);
 }
 
 function eventAfterCursor(event, marker) {
@@ -177,9 +225,14 @@ function eligibleCustomerEvents(thread, customerId, marker) {
     .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
 }
 
-function freshCustomerEventsSinceStart(thread, customerId) {
+function freshTriggerEventsSinceStart(thread, customerId) {
   return (thread?.events || [])
-    .filter(e => e && e.author_id === customerId && e.visibility !== 'agents' && ['message', 'file'].includes(e.type))
+    .filter(e => e && e.visibility !== 'agents')
+    .filter(e => {
+      if (['message', 'file'].includes(e.type)) return e.author_id === customerId;
+      if (isPrechatFilledForm(e)) return !e.author_id || e.author_id === customerId;
+      return false;
+    })
     .filter(e => Date.parse(e.created_at) >= SERVICE_STARTED_MS)
     .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
 }
@@ -225,10 +278,11 @@ async function bootstrapHistory() {
   }
 }
 
-async function sendOpenBanner(topicId, chatId, name, reopened) {
+async function sendOpenBanner(topicId, chatId, name, reopened, issue = '') {
+  const issueLine = cleanOneLine(issue) ? `\n🏷 Kendala: ${cleanOneLine(issue)}` : '';
   const text = reopened
-    ? `🟢 Chat dibuka kembali\n👤 ${name}`
-    : `🟢 LiveChat baru\n👤 ${name}`;
+    ? `🟢 Chat dibuka kembali\n👤 Nama: ${name}${issueLine}`
+    : `🟢 LiveChat baru\n👤 Nama: ${name}${issueLine}`;
   await tgCall('sendMessage', {
     chat_id: TG_GROUP_ID,
     message_thread_id: topicId,
@@ -239,10 +293,10 @@ async function sendOpenBanner(topicId, chatId, name, reopened) {
   });
 }
 
-async function createTopic(name, chatId, customerId, cursorAt) {
+async function createTopic(name, chatId, customerId, cursorAt, issue = '') {
   const topic = await tgCall('createForumTopic', {
     chat_id: TG_GROUP_ID,
-    name: topicName(name, true),
+    name: topicName(name, true, issue),
   });
   const marker = {
     v: 2,
@@ -257,11 +311,11 @@ async function createTopic(name, chatId, customerId, cursorAt) {
   historicalByCustomer.set(customerId, marker);
   topicToActiveChat.set(String(marker.t), chatId);
   stats.topicsCreated += 1;
-  await sendOpenBanner(marker.t, chatId, name, false);
+  await sendOpenBanner(marker.t, chatId, name, false, issue);
   return marker;
 }
 
-async function reopenTopic(marker, chatId, name) {
+async function reopenTopic(marker, chatId, name, issue = '') {
   try {
     await tgCall('reopenForumTopic', {
       chat_id: TG_GROUP_ID,
@@ -274,18 +328,18 @@ async function reopenTopic(marker, chatId, name) {
   await tgCall('editForumTopic', {
     chat_id: TG_GROUP_ID,
     message_thread_id: marker.t,
-    name: topicName(name, true),
+    name: topicName(name, true, issue),
   });
   marker.s = 'o';
   await saveMarker(chatId, marker);
   historicalByCustomer.set(marker.c, marker);
   topicToActiveChat.set(String(marker.t), chatId);
   stats.topicsReopened += 1;
-  await sendOpenBanner(marker.t, chatId, name, true);
+  await sendOpenBanner(marker.t, chatId, name, true, issue);
   return marker;
 }
 
-async function closeTopic(marker, chatId, name, reason = 'LiveChat ditutup') {
+async function closeTopic(marker, chatId, name, reason = 'LiveChat ditutup', issue = '') {
   if (!marker || marker.s === 'c') return;
   try {
     await tgCall('sendMessage', {
@@ -300,7 +354,7 @@ async function closeTopic(marker, chatId, name, reason = 'LiveChat ditutup') {
     await tgCall('editForumTopic', {
       chat_id: TG_GROUP_ID,
       message_thread_id: marker.t,
-      name: topicName(name, false),
+      name: topicName(name, false, issue),
     });
   } catch (err) {
     console.warn('[bridge] rename closed warning:', compactError(err));
@@ -350,57 +404,82 @@ async function processActiveChat(summary, topicBudget) {
 
   const customer = customerFrom(full) || customerFrom(summary);
   if (!customer?.id) return { usedTopic: 0 };
-  const name = customerName(customer);
+
+  const prechat = prechatDataFromThread(thread);
+  const name = prechat.name || customerName(customer);
+  const issue = prechat.issue || '';
   chatNameCache.set(summary.id, name);
 
   let marker = decodeMarker(full) || decodeMarker(summary);
   let usedTopic = 0;
 
   if (!marker) {
-    const fresh = freshCustomerEventsSinceStart(thread, customer.id);
+    const fresh = freshTriggerEventsSinceStart(thread, customer.id);
     if (fresh.length === 0) {
-      // Critical anti-spam rule: an already-active chat found during a deploy
-      // does NOT create/reopen a topic until the customer sends something new.
+      // Anti-spam: chats that already existed before this deploy remain silent.
+      // A new pre-chat submission (filled_form) counts as a fresh customer event,
+      // so a Telegram topic can be created before the customer types a message.
       return { usedTopic: 0 };
     }
 
     const old = historicalByCustomer.get(customer.id);
     if (old) {
-      // Same customer, possibly a new LiveChat chat_id: reuse the old Telegram topic.
       marker = {
         ...old,
         c: customer.id,
-        // Start this new LiveChat session at server-start so old history is never replayed.
         a: new Date(SERVICE_STARTED_MS).toISOString(),
         i: null,
         seen: [],
       };
       await saveMarker(summary.id, marker);
       if (marker.s === 'c') {
-        marker = await reopenTopic(marker, summary.id, name);
+        marker = await reopenTopic(marker, summary.id, name, issue);
       } else {
         topicToActiveChat.set(String(marker.t), summary.id);
         await tgCall('editForumTopic', {
           chat_id: TG_GROUP_ID,
           message_thread_id: marker.t,
-          name: topicName(name, true),
+          name: topicName(name, true, issue),
         });
-        await sendOpenBanner(marker.t, summary.id, name, true);
+        await sendOpenBanner(marker.t, summary.id, name, true, issue);
       }
     } else {
       if (topicBudget <= 0) {
         console.warn(`[bridge] safety limit: topic creation skipped for ${name}`);
         return { usedTopic: 0 };
       }
-      marker = await createTopic(name, summary.id, customer.id, new Date(SERVICE_STARTED_MS).toISOString());
+      marker = await createTopic(name, summary.id, customer.id, new Date(SERVICE_STARTED_MS).toISOString(), issue);
       usedTopic = 1;
+    }
+
+    // The pre-chat form itself is already represented by the topic title/open banner.
+    // Mark it as consumed so it can never be replayed as history.
+    const triggerForm = fresh.find(isPrechatFilledForm);
+    if (triggerForm?.created_at) {
+      marker.a = triggerForm.created_at;
+      marker.i = triggerForm.id || null;
+      marker.seen = [...(marker.seen || []), triggerForm.id].filter(Boolean).slice(-10);
+      marker = await saveMarker(summary.id, marker);
+      historicalByCustomer.set(customer.id, marker);
     }
   } else {
     historicalByCustomer.set(customer.id, marker);
     if (marker.s === 'c') {
-      marker = await reopenTopic(marker, summary.id, name);
+      marker = await reopenTopic(marker, summary.id, name, issue);
     } else {
       topicToActiveChat.set(String(marker.t), summary.id);
+      // Keep title synchronized with the latest pre-chat selection.
+      if (issue) {
+        try {
+          await tgCall('editForumTopic', {
+            chat_id: TG_GROUP_ID,
+            message_thread_id: marker.t,
+            name: topicName(name, true, issue),
+          });
+        } catch (err) {
+          console.warn('[bridge] topic title update warning:', compactError(err));
+        }
+      }
     }
   }
 
@@ -618,7 +697,7 @@ app.get('/', (req, res) => {
 <title>LiveChat ↔ Telegram Bridge v2</title>
 <style>body{font-family:system-ui,-apple-system,sans-serif;max-width:850px;margin:40px auto;padding:0 18px;background:#0f1115;color:#e9edf1} .card{background:#181c23;border:1px solid #2b313b;border-radius:16px;padding:22px;margin:14px 0} .ok{color:#75e69b}.bad{color:#ff8d8d} code{background:#0b0d10;padding:2px 7px;border-radius:6px} h1{font-size:25px} table{width:100%;border-collapse:collapse}td{padding:7px 0;border-bottom:1px solid #252a32}td:first-child{color:#9fa9b6}</style></head>
 <body><h1>LiveChat ↔ Telegram Bridge v2</h1>
-<div class="card"><b class="${good ? 'ok' : 'bad'}">${good ? '● READY' : '● BELUM LENGKAP'}</b><p>Workflow: chat aktif baru → topic Telegram → reply Telegram → LiveChat → End Chat menutup topic → member kembali membuka topic lama.</p></div>
+<div class="card"><b class="${good ? 'ok' : 'bad'}">${good ? '● READY' : '● BELUM LENGKAP'}</b><p>Workflow: selesai isi pre-chat form → topic Telegram langsung dibuat (Nama + Kendala) → reply Telegram → LiveChat → End Chat menutup topic → member kembali membuka topic lama.</p></div>
 <div class="card"><table>
 <tr><td>Telegram</td><td>${TG_TOKEN && TG_GROUP_ID ? 'configured' : 'missing'}</td></tr>
 <tr><td>LiveChat PAT</td><td>${LC_TOKEN ? 'configured' : 'missing'}</td></tr>
@@ -633,7 +712,7 @@ app.get('/', (req, res) => {
 <tr><td>Last poll</td><td>${esc(stats.lastPollAt || '-')}</td></tr>
 <tr><td>Error poll</td><td>${esc(stats.lastPollError || '-')}</td></tr>
 </table></div>
-<div class="card"><b>Anti-spam aktif</b><p>Chat lama/End Chat tidak membuat topic. Saat server baru deploy, chat yang sudah aktif juga tidak membuat topic sampai customer mengirim pesan baru. Maksimal ${MAX_NEW_TOPICS_PER_POLL} topic baru per polling.</p><p>Command Telegram: <code>/close</code> atau <code>/end</code> untuk End Chat.</p></div>
+<div class="card"><b>Anti-spam aktif</b><p>Chat lama/End Chat tidak membuat topic. Pre-chat form baru (Nama + Kendala) sudah cukup untuk membuat topic, jadi member tidak perlu mengetik pesan dulu. Saat server baru deploy, history lama tetap diabaikan. Maksimal ${MAX_NEW_TOPICS_PER_POLL} topic baru per polling.</p><p>Command Telegram: <code>/close</code> atau <code>/end</code> untuk End Chat.</p></div>
 </body></html>`);
 });
 
