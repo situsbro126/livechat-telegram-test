@@ -322,7 +322,8 @@ function isMissingTopicError(err) {
     msg.includes('topic not found') ||
     msg.includes('forum topic not found') ||
     msg.includes('thread not found') ||
-    msg.includes('topic_deleted');
+    msg.includes('topic_deleted') ||
+    msg.includes('topic_id_invalid');
 }
 
 async function recoverDeletedTopic(marker, chatId, name, issue = '') {
@@ -480,11 +481,19 @@ async function processActiveChat(summary, topicBudget) {
         marker = await reopenTopic(marker, summary.id, name, issue);
       } else {
         topicToActiveChat.set(String(marker.t), summary.id);
-        await tgCall('editForumTopic', {
-          chat_id: TG_GROUP_ID,
-          message_thread_id: marker.t,
-          name: topicName(name, true, issue),
-        });
+        try {
+          await tgCall('editForumTopic', {
+            chat_id: TG_GROUP_ID,
+            message_thread_id: marker.t,
+            name: topicName(name, true, issue),
+          });
+        } catch (err) {
+          if (isMissingTopicError(err)) {
+            marker = await recoverDeletedTopic(marker, summary.id, name, issue);
+          } else {
+            throw err;
+          }
+        }
         await sendOpenBanner(marker.t, summary.id, name, true, issue);
       }
     } else {
@@ -521,7 +530,11 @@ async function processActiveChat(summary, topicBudget) {
             name: topicName(name, true, issue),
           });
         } catch (err) {
-          console.warn('[bridge] topic title update warning:', compactError(err));
+          if (isMissingTopicError(err)) {
+            marker = await recoverDeletedTopic(marker, summary.id, name, issue);
+          } else {
+            console.warn('[bridge] topic title update warning:', compactError(err));
+          }
         }
       }
     }
@@ -762,9 +775,9 @@ app.get('/', (req, res) => {
   const good = configured();
   res.type('html').send(`<!doctype html>
 <html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LiveChat ↔ Telegram Bridge v2</title>
+<title>LiveChat ↔ Telegram Bridge v2.2 Recovery</title>
 <style>body{font-family:system-ui,-apple-system,sans-serif;max-width:850px;margin:40px auto;padding:0 18px;background:#0f1115;color:#e9edf1} .card{background:#181c23;border:1px solid #2b313b;border-radius:16px;padding:22px;margin:14px 0} .ok{color:#75e69b}.bad{color:#ff8d8d} code{background:#0b0d10;padding:2px 7px;border-radius:6px} h1{font-size:25px} table{width:100%;border-collapse:collapse}td{padding:7px 0;border-bottom:1px solid #252a32}td:first-child{color:#9fa9b6}</style></head>
-<body><h1>LiveChat ↔ Telegram Bridge v2</h1>
+<body><h1>LiveChat ↔ Telegram Bridge v2.2 Recovery</h1>
 <div class="card"><b class="${good ? 'ok' : 'bad'}">${good ? '● READY' : '● BELUM LENGKAP'}</b><p>Workflow: selesai isi pre-chat form → topic Telegram langsung dibuat (Nama + Kendala) → pesan baru dipantau cepat → reply Telegram → LiveChat → End Chat menutup topic → member kembali membuka topic lama.</p></div>
 <div class="card"><table>
 <tr><td>Telegram</td><td>${TG_TOKEN && TG_GROUP_ID ? 'configured' : 'missing'}</td></tr>
