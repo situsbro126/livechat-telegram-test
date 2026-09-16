@@ -1,0 +1,654 @@
+'use strict';
+
+const express = require('express');
+
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+
+const PORT = Number(process.env.PORT || 10000);
+const TG_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
+const TG_GROUP_ID = String(process.env.TELEGRAM_GROUP_ID || '').trim();
+const TG_SECRET = String(process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
+const LC_TOKEN = String(process.env.LIVECHAT_ACCESS_TOKEN || '').trim();
+const POLL_MS = Math.max(3000, Number(process.env.LIVECHAT_POLL_SECONDS || 4) * 1000);
+const MAX_NEW_TOPICS_PER_POLL = Math.max(1, Number(process.env.MAX_NEW_TOPICS_PER_POLL || 3));
+const BOOTSTRAP_SCAN_PAGES = Math.max(1, Math.min(10, Number(process.env.BOOTSTRAP_SCAN_PAGES || 5)));
+
+const LC_BASE = 'https://api.livechatinc.com/v3.5/agent/action';
+const TG_BASE = TG_TOKEN ? `https://api.telegram.org/bot${TG_TOKEN}` : '';
+const BRIDGE_PREFIX = 'TG2:';
+const SERVICE_STARTED_MS = Date.now();
+
+// Runtime cache only. Durable mapping is stored on each LiveChat chat in
+// the built-in public test.string_property, so Render restarts don't cause spam.
+const topicToActiveChat = new Map(); // String(topicId) -> chatId
+const historicalByCustomer = new Map(); // customerId -> marker from newest known chat
+const chatNameCache = new Map(); // chatId -> customer name
+
+const stats = {
+  startedAt: new Date().toISOString(),
+  lastPollAt: null,
+  lastPollError: null,
+  lastTelegramError: null,
+  visibleChats: 0,
+  activeChats: 0,
+  forwardedEvents: 0,
+  telegramRepliesSent: 0,
+  topicsCreated: 0,
+  topicsReopened: 0,
+  topicsClosed: 0,
+  bootstrapMappings: 0,
+};
+
+let pollRunning = false;
+
+function configured() {
+  return Boolean(TG_TOKEN && TG_GROUP_ID && TG_SECRET && PUBLIC_BASE_URL && LC_TOKEN);
+}
+
+function compactError(err) {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function fetchJson(url, options = {}) {
+  const res = await fetch(url, options);
+  const text = await res.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  }
+  if (!res.ok) {
+    const body = data ? JSON.stringify(data) : text;
+    throw new Error(`HTTP ${res.status}: ${body.slice(0, 700)}`);
+  }
+  return data;
+}
+
+async function lcCall(action, payload = {}) {
+  if (!LC_TOKEN) throw new Error('LIVECHAT_ACCESS_TOKEN belum diisi');
+  try {
+    return await fetchJson(`${LC_BASE}/${action}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${LC_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    throw new Error(`LiveChat ${action}: ${compactError(err)}`);
+  }
+}
+
+async function tgCall(method, payload = {}) {
+  if (!TG_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN belum diisi');
+  try {
+    const data = await fetchJson(`${TG_BASE}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!data?.ok) throw new Error(JSON.stringify(data));
+    return data.result;
+  } catch (err) {
+    stats.lastTelegramError = `${new Date().toISOString()} ${method}: ${compactError(err)}`;
+    throw new Error(`Telegram ${method}: ${compactError(err)}`);
+  }
+}
+
+function encodeMarker(marker) {
+  const json = JSON.stringify(marker);
+  return BRIDGE_PREFIX + Buffer.from(json, 'utf8').toString('base64url');
+}
+
+function decodeMarker(summaryOrChat) {
+  const raw = summaryOrChat?.properties?.test?.string_property;
+  if (typeof raw !== 'string' || !raw.startsWith(BRIDGE_PREFIX)) return null;
+  try {
+    const json = Buffer.from(raw.slice(BRIDGE_PREFIX.length), 'base64url').toString('utf8');
+    const m = JSON.parse(json);
+    if (!m || m.v !== 2 || !Number.isInteger(Number(m.t)) || !m.c) return null;
+    m.t = Number(m.t);
+    m.s = m.s === 'c' ? 'c' : 'o';
+    m.seen = Array.isArray(m.seen) ? m.seen.slice(-10) : [];
+    return m;
+  } catch {
+    return null;
+  }
+}
+
+async function saveMarker(chatId, marker) {
+  const clean = {
+    v: 2,
+    t: Number(marker.t),                 // Telegram topic id
+    c: String(marker.c),                 // LiveChat customer id
+    s: marker.s === 'c' ? 'c' : 'o',    // open / closed
+    a: marker.a || null,                 // last forwarded created_at
+    i: marker.i || null,                 // last forwarded event id
+    seen: Array.isArray(marker.seen) ? marker.seen.slice(-10) : [],
+  };
+  await lcCall('update_chat_properties', {
+    id: chatId,
+    properties: {
+      test: {
+        string_property: encodeMarker(clean),
+      },
+    },
+  });
+  return clean;
+}
+
+function customerFrom(chat) {
+  return Array.isArray(chat?.users) ? chat.users.find(u => u?.type === 'customer') || null : null;
+}
+
+function customerName(customer) {
+  const name = String(customer?.name || '').trim();
+  if (name) return name;
+  const email = String(customer?.email || '').trim();
+  if (email) return email.split('@')[0];
+  return `Member ${String(customer?.id || 'unknown').slice(0, 8)}`;
+}
+
+function topicName(name, open = true) {
+  const clean = String(name || 'Member').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return `${open ? '🟢' : '🔴'} ${clean}`.slice(0, 128);
+}
+
+function eventAfterCursor(event, marker) {
+  if (!event?.created_at) return false;
+  if (Array.isArray(marker.seen) && marker.seen.includes(event.id)) return false;
+  if (!marker.a) return true;
+  const e = Date.parse(event.created_at);
+  const c = Date.parse(marker.a);
+  if (Number.isNaN(e) || Number.isNaN(c)) return event.created_at > marker.a;
+  return e >= c;
+}
+
+function eligibleCustomerEvents(thread, customerId, marker) {
+  return (thread?.events || [])
+    .filter(e => e && e.author_id === customerId && e.visibility !== 'agents' && ['message', 'file'].includes(e.type))
+    .filter(e => eventAfterCursor(e, marker))
+    .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+}
+
+function freshCustomerEventsSinceStart(thread, customerId) {
+  return (thread?.events || [])
+    .filter(e => e && e.author_id === customerId && e.visibility !== 'agents' && ['message', 'file'].includes(e.type))
+    .filter(e => Date.parse(e.created_at) >= SERVICE_STARTED_MS)
+    .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+}
+
+async function listChatsPages(maxPages) {
+  const all = [];
+  let pageId = null;
+  for (let page = 0; page < maxPages; page++) {
+    const payload = pageId
+      ? { page_id: pageId }
+      : {
+          limit: 100,
+          sort_order: 'desc',
+          filters: { include_active: true, include_chats_without_threads: false },
+        };
+    const data = await lcCall('list_chats', payload);
+    const batch = Array.isArray(data?.chats_summary) ? data.chats_summary : [];
+    all.push(...batch);
+    pageId = data?.next_page_id || null;
+    if (!pageId || batch.length === 0) break;
+  }
+  return all;
+}
+
+function rememberHistorical(summary) {
+  const marker = decodeMarker(summary);
+  const customer = customerFrom(summary);
+  if (!marker || !customer?.id) return;
+  if (!historicalByCustomer.has(customer.id)) {
+    historicalByCustomer.set(customer.id, marker);
+  }
+}
+
+async function bootstrapHistory() {
+  if (!LC_TOKEN) return;
+  try {
+    const chats = await listChatsPages(BOOTSTRAP_SCAN_PAGES);
+    for (const chat of chats) rememberHistorical(chat);
+    stats.bootstrapMappings = historicalByCustomer.size;
+    console.log(`[bridge] bootstrap mappings: ${historicalByCustomer.size}`);
+  } catch (err) {
+    console.error('[bridge] bootstrap failed:', compactError(err));
+  }
+}
+
+async function sendOpenBanner(topicId, chatId, name, reopened) {
+  const text = reopened
+    ? `🟢 Chat dibuka kembali\n👤 ${name}`
+    : `🟢 LiveChat baru\n👤 ${name}`;
+  await tgCall('sendMessage', {
+    chat_id: TG_GROUP_ID,
+    message_thread_id: topicId,
+    text,
+    reply_markup: {
+      inline_keyboard: [[{ text: '✅ End Chat', callback_data: `close:${chatId}` }]],
+    },
+  });
+}
+
+async function createTopic(name, chatId, customerId, cursorAt) {
+  const topic = await tgCall('createForumTopic', {
+    chat_id: TG_GROUP_ID,
+    name: topicName(name, true),
+  });
+  const marker = {
+    v: 2,
+    t: Number(topic.message_thread_id),
+    c: customerId,
+    s: 'o',
+    a: cursorAt || new Date(SERVICE_STARTED_MS).toISOString(),
+    i: null,
+    seen: [],
+  };
+  await saveMarker(chatId, marker);
+  historicalByCustomer.set(customerId, marker);
+  topicToActiveChat.set(String(marker.t), chatId);
+  stats.topicsCreated += 1;
+  await sendOpenBanner(marker.t, chatId, name, false);
+  return marker;
+}
+
+async function reopenTopic(marker, chatId, name) {
+  try {
+    await tgCall('reopenForumTopic', {
+      chat_id: TG_GROUP_ID,
+      message_thread_id: marker.t,
+    });
+  } catch (err) {
+    // Reopening an already-open topic is harmless for our workflow.
+    console.warn('[bridge] reopen warning:', compactError(err));
+  }
+  await tgCall('editForumTopic', {
+    chat_id: TG_GROUP_ID,
+    message_thread_id: marker.t,
+    name: topicName(name, true),
+  });
+  marker.s = 'o';
+  await saveMarker(chatId, marker);
+  historicalByCustomer.set(marker.c, marker);
+  topicToActiveChat.set(String(marker.t), chatId);
+  stats.topicsReopened += 1;
+  await sendOpenBanner(marker.t, chatId, name, true);
+  return marker;
+}
+
+async function closeTopic(marker, chatId, name, reason = 'LiveChat ditutup') {
+  if (!marker || marker.s === 'c') return;
+  try {
+    await tgCall('sendMessage', {
+      chat_id: TG_GROUP_ID,
+      message_thread_id: marker.t,
+      text: `🔴 ${reason}`,
+    });
+  } catch (err) {
+    console.warn('[bridge] close banner warning:', compactError(err));
+  }
+  try {
+    await tgCall('editForumTopic', {
+      chat_id: TG_GROUP_ID,
+      message_thread_id: marker.t,
+      name: topicName(name, false),
+    });
+  } catch (err) {
+    console.warn('[bridge] rename closed warning:', compactError(err));
+  }
+  try {
+    await tgCall('closeForumTopic', {
+      chat_id: TG_GROUP_ID,
+      message_thread_id: marker.t,
+    });
+  } catch (err) {
+    console.warn('[bridge] close topic warning:', compactError(err));
+  }
+  marker.s = 'c';
+  await saveMarker(chatId, marker);
+  historicalByCustomer.set(marker.c, marker);
+  topicToActiveChat.delete(String(marker.t));
+  stats.topicsClosed += 1;
+}
+
+async function forwardEventToTelegram(topicId, name, event) {
+  if (event.type === 'message') {
+    await tgCall('sendMessage', {
+      chat_id: TG_GROUP_ID,
+      message_thread_id: topicId,
+      text: `👤 ${name}\n${event.text || ''}`,
+    });
+    return;
+  }
+  if (event.type === 'file') {
+    const fileLabel = event.name || event.alternative_text || 'File';
+    await tgCall('sendMessage', {
+      chat_id: TG_GROUP_ID,
+      message_thread_id: topicId,
+      text: `👤 ${name}\n📎 ${fileLabel}\n${event.url || ''}`,
+      disable_web_page_preview: false,
+    });
+  }
+}
+
+async function processActiveChat(summary, topicBudget) {
+  const latest = summary?.last_thread_summary;
+  if (!latest?.active) return { usedTopic: 0 };
+
+  const full = await lcCall('get_chat', { chat_id: summary.id });
+  const thread = full?.thread;
+  if (!thread?.active) return { usedTopic: 0 };
+
+  const customer = customerFrom(full) || customerFrom(summary);
+  if (!customer?.id) return { usedTopic: 0 };
+  const name = customerName(customer);
+  chatNameCache.set(summary.id, name);
+
+  let marker = decodeMarker(full) || decodeMarker(summary);
+  let usedTopic = 0;
+
+  if (!marker) {
+    const fresh = freshCustomerEventsSinceStart(thread, customer.id);
+    if (fresh.length === 0) {
+      // Critical anti-spam rule: an already-active chat found during a deploy
+      // does NOT create/reopen a topic until the customer sends something new.
+      return { usedTopic: 0 };
+    }
+
+    const old = historicalByCustomer.get(customer.id);
+    if (old) {
+      // Same customer, possibly a new LiveChat chat_id: reuse the old Telegram topic.
+      marker = {
+        ...old,
+        c: customer.id,
+        // Start this new LiveChat session at server-start so old history is never replayed.
+        a: new Date(SERVICE_STARTED_MS).toISOString(),
+        i: null,
+        seen: [],
+      };
+      await saveMarker(summary.id, marker);
+      if (marker.s === 'c') {
+        marker = await reopenTopic(marker, summary.id, name);
+      } else {
+        topicToActiveChat.set(String(marker.t), summary.id);
+        await tgCall('editForumTopic', {
+          chat_id: TG_GROUP_ID,
+          message_thread_id: marker.t,
+          name: topicName(name, true),
+        });
+        await sendOpenBanner(marker.t, summary.id, name, true);
+      }
+    } else {
+      if (topicBudget <= 0) {
+        console.warn(`[bridge] safety limit: topic creation skipped for ${name}`);
+        return { usedTopic: 0 };
+      }
+      marker = await createTopic(name, summary.id, customer.id, new Date(SERVICE_STARTED_MS).toISOString());
+      usedTopic = 1;
+    }
+  } else {
+    historicalByCustomer.set(customer.id, marker);
+    if (marker.s === 'c') {
+      marker = await reopenTopic(marker, summary.id, name);
+    } else {
+      topicToActiveChat.set(String(marker.t), summary.id);
+    }
+  }
+
+  const events = eligibleCustomerEvents(thread, customer.id, marker);
+  let changed = false;
+  for (const event of events) {
+    await forwardEventToTelegram(marker.t, name, event);
+    marker.a = event.created_at;
+    marker.i = event.id || null;
+    marker.seen = [...(marker.seen || []), event.id].filter(Boolean).slice(-10);
+    stats.forwardedEvents += 1;
+    changed = true;
+  }
+  if (changed) {
+    marker = await saveMarker(summary.id, marker);
+    historicalByCustomer.set(customer.id, marker);
+  }
+
+  return { usedTopic };
+}
+
+async function syncClosedChats(chats) {
+  for (const summary of chats) {
+    const marker = decodeMarker(summary);
+    if (!marker || marker.s === 'c') continue;
+    if (summary?.last_thread_summary?.active === false) {
+      const customer = customerFrom(summary);
+      const name = customerName(customer);
+      chatNameCache.set(summary.id, name);
+      try {
+        await closeTopic(marker, summary.id, name, 'LiveChat telah di-End Chat');
+      } catch (err) {
+        console.error(`[bridge] close sync ${summary.id}:`, compactError(err));
+      }
+    }
+  }
+}
+
+async function pollOnce() {
+  if (!configured() || pollRunning) return;
+  pollRunning = true;
+  stats.lastPollAt = new Date().toISOString();
+  stats.lastPollError = null;
+  try {
+    // One newest page per normal poll. Historical topic mappings are loaded at startup.
+    const chats = await listChatsPages(1);
+    stats.visibleChats = chats.length;
+    stats.activeChats = chats.filter(c => c?.last_thread_summary?.active === true).length;
+
+    // Build historical cache before active processing so new chat_ids can reuse topics.
+    for (const chat of chats) rememberHistorical(chat);
+
+    // Rebuild active topic routing on every poll.
+    topicToActiveChat.clear();
+    let topicBudget = MAX_NEW_TOPICS_PER_POLL;
+
+    for (const summary of chats) {
+      if (summary?.last_thread_summary?.active !== true) continue;
+      try {
+        const result = await processActiveChat(summary, topicBudget);
+        topicBudget -= result.usedTopic || 0;
+      } catch (err) {
+        console.error(`[bridge] active chat ${summary?.id}:`, compactError(err));
+      }
+    }
+
+    await syncClosedChats(chats);
+  } catch (err) {
+    stats.lastPollError = `${new Date().toISOString()} ${compactError(err)}`;
+    console.error('[bridge] poll failed:', compactError(err));
+  } finally {
+    pollRunning = false;
+  }
+}
+
+async function sendTelegramReplyToLiveChat(topicId, text) {
+  let chatId = topicToActiveChat.get(String(topicId));
+  if (!chatId) {
+    // Do a quick refresh once; useful right after a Render restart.
+    await pollOnce();
+    chatId = topicToActiveChat.get(String(topicId));
+  }
+  if (!chatId) {
+    throw new Error('Topic ini tidak sedang terhubung ke LiveChat aktif. Tunggu member chat lagi.');
+  }
+  await lcCall('send_event', {
+    chat_id: chatId,
+    event: { type: 'message', text, visibility: 'all' },
+  });
+  stats.telegramRepliesSent += 1;
+}
+
+async function endChatFromTelegram(topicId, requestedChatId = null) {
+  let chatId = requestedChatId || topicToActiveChat.get(String(topicId));
+  if (!chatId) {
+    await pollOnce();
+    chatId = requestedChatId || topicToActiveChat.get(String(topicId));
+  }
+  if (!chatId) throw new Error('Tidak menemukan LiveChat aktif untuk topic ini.');
+
+  await lcCall('deactivate_chat', {
+    id: chatId,
+    ignore_requester_presence: true,
+  });
+
+  // Close immediately instead of waiting for the next poll.
+  const chats = await listChatsPages(1);
+  const summary = chats.find(c => c.id === chatId);
+  const marker = summary ? decodeMarker(summary) : null;
+  const name = chatNameCache.get(chatId) || customerName(customerFrom(summary));
+  if (marker) {
+    await closeTopic(marker, chatId, name, 'Chat ditutup dari Telegram');
+  }
+}
+
+async function configureTelegramWebhook() {
+  if (!TG_TOKEN || !PUBLIC_BASE_URL || !TG_SECRET) return;
+  const url = `${PUBLIC_BASE_URL}/telegram/webhook`;
+  await tgCall('setWebhook', {
+    url,
+    secret_token: TG_SECRET,
+    allowed_updates: ['message', 'callback_query'],
+    drop_pending_updates: true,
+  });
+  console.log(`[bridge] Telegram webhook: ${url}`);
+}
+
+app.post('/telegram/webhook', async (req, res) => {
+  if (TG_SECRET) {
+    const got = req.get('x-telegram-bot-api-secret-token') || '';
+    if (got !== TG_SECRET) return res.status(403).json({ ok: false });
+  }
+
+  // Ack quickly; work continues asynchronously.
+  res.json({ ok: true });
+  const update = req.body || {};
+
+  try {
+    if (update.callback_query) {
+      const q = update.callback_query;
+      const msg = q.message;
+      if (String(msg?.chat?.id) !== TG_GROUP_ID) return;
+      const topicId = msg?.message_thread_id;
+      const data = String(q.data || '');
+      if (data.startsWith('close:')) {
+        await tgCall('answerCallbackQuery', { callback_query_id: q.id, text: 'Menutup LiveChat…' });
+        try {
+          await endChatFromTelegram(topicId, data.slice(6) || null);
+        } catch (err) {
+          await tgCall('sendMessage', {
+            chat_id: TG_GROUP_ID,
+            message_thread_id: topicId,
+            text: `⚠️ Gagal End Chat: ${compactError(err)}`,
+          });
+        }
+      }
+      return;
+    }
+
+    const msg = update.message;
+    if (!msg || msg.from?.is_bot) return;
+    if (String(msg.chat?.id) !== TG_GROUP_ID) return;
+    if (!msg.message_thread_id) return;
+
+    const text = String(msg.text || msg.caption || '').trim();
+    if (!text) return;
+
+    if (text === '/close' || text === '/end') {
+      try {
+        await endChatFromTelegram(msg.message_thread_id);
+      } catch (err) {
+        await tgCall('sendMessage', {
+          chat_id: TG_GROUP_ID,
+          message_thread_id: msg.message_thread_id,
+          text: `⚠️ ${compactError(err)}`,
+        });
+      }
+      return;
+    }
+
+    if (text.startsWith('/')) return;
+
+    try {
+      await sendTelegramReplyToLiveChat(msg.message_thread_id, text);
+    } catch (err) {
+      await tgCall('sendMessage', {
+        chat_id: TG_GROUP_ID,
+        message_thread_id: msg.message_thread_id,
+        text: `⚠️ Balasan tidak terkirim: ${compactError(err)}`,
+      });
+    }
+  } catch (err) {
+    console.error('[bridge] telegram update:', compactError(err));
+  }
+});
+
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    configured: configured(),
+    telegram: Boolean(TG_TOKEN && TG_GROUP_ID && TG_SECRET),
+    livechat: Boolean(LC_TOKEN),
+    poll_seconds: POLL_MS / 1000,
+    active_topic_routes: topicToActiveChat.size,
+    historical_customer_topics: historicalByCustomer.size,
+    stats,
+  });
+});
+
+app.get('/', (req, res) => {
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[c]));
+  const good = configured();
+  res.type('html').send(`<!doctype html>
+<html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LiveChat ↔ Telegram Bridge v2</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:850px;margin:40px auto;padding:0 18px;background:#0f1115;color:#e9edf1} .card{background:#181c23;border:1px solid #2b313b;border-radius:16px;padding:22px;margin:14px 0} .ok{color:#75e69b}.bad{color:#ff8d8d} code{background:#0b0d10;padding:2px 7px;border-radius:6px} h1{font-size:25px} table{width:100%;border-collapse:collapse}td{padding:7px 0;border-bottom:1px solid #252a32}td:first-child{color:#9fa9b6}</style></head>
+<body><h1>LiveChat ↔ Telegram Bridge v2</h1>
+<div class="card"><b class="${good ? 'ok' : 'bad'}">${good ? '● READY' : '● BELUM LENGKAP'}</b><p>Workflow: chat aktif baru → topic Telegram → reply Telegram → LiveChat → End Chat menutup topic → member kembali membuka topic lama.</p></div>
+<div class="card"><table>
+<tr><td>Telegram</td><td>${TG_TOKEN && TG_GROUP_ID ? 'configured' : 'missing'}</td></tr>
+<tr><td>LiveChat PAT</td><td>${LC_TOKEN ? 'configured' : 'missing'}</td></tr>
+<tr><td>Polling</td><td>${POLL_MS / 1000} detik</td></tr>
+<tr><td>Chat terlihat</td><td>${stats.visibleChats}</td></tr>
+<tr><td>Chat aktif</td><td>${stats.activeChats}</td></tr>
+<tr><td>Topic aktif</td><td>${topicToActiveChat.size}</td></tr>
+<tr><td>Mapping customer</td><td>${historicalByCustomer.size}</td></tr>
+<tr><td>Pesan member diteruskan</td><td>${stats.forwardedEvents}</td></tr>
+<tr><td>Balasan Telegram → LiveChat</td><td>${stats.telegramRepliesSent}</td></tr>
+<tr><td>Topic dibuat / reopen / close</td><td>${stats.topicsCreated} / ${stats.topicsReopened} / ${stats.topicsClosed}</td></tr>
+<tr><td>Last poll</td><td>${esc(stats.lastPollAt || '-')}</td></tr>
+<tr><td>Error poll</td><td>${esc(stats.lastPollError || '-')}</td></tr>
+</table></div>
+<div class="card"><b>Anti-spam aktif</b><p>Chat lama/End Chat tidak membuat topic. Saat server baru deploy, chat yang sudah aktif juga tidak membuat topic sampai customer mengirim pesan baru. Maksimal ${MAX_NEW_TOPICS_PER_POLL} topic baru per polling.</p><p>Command Telegram: <code>/close</code> atau <code>/end</code> untuk End Chat.</p></div>
+</body></html>`);
+});
+
+app.listen(PORT, '0.0.0.0', async () => {
+  console.log(`[bridge] listening on 0.0.0.0:${PORT}`);
+  if (!configured()) {
+    console.warn('[bridge] environment variables belum lengkap; buka /health');
+    return;
+  }
+  try {
+    await configureTelegramWebhook();
+  } catch (err) {
+    console.error('[bridge] webhook setup failed:', compactError(err));
+  }
+  await bootstrapHistory();
+  await pollOnce();
+  setInterval(() => { pollOnce().catch(err => console.error(err)); }, POLL_MS);
+});
