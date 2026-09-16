@@ -21,6 +21,9 @@ const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TG_GROUP_ID = process.env.TELEGRAM_GROUP_ID || '';
 const TG_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
 const LIVECHAT_TOKEN = process.env.LIVECHAT_ACCESS_TOKEN || '';
+const LIVECHAT_AUTH_SCHEME = (process.env.LIVECHAT_AUTH_SCHEME || 'Basic').trim();
+const LIVECHAT_WEBHOOK_SECRET = process.env.LIVECHAT_WEBHOOK_SECRET || '';
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
 const LIVECHAT_WEBHOOK_KEY = process.env.LIVECHAT_WEBHOOK_KEY || 'change-me';
 const DEMO_MODE = String(process.env.DEMO_MODE || 'true').toLowerCase() !== 'false';
 const DB_FILE = path.join(__dirname, 'data.json');
@@ -45,7 +48,7 @@ async function lcSend(chatId, text) {
   if (!LIVECHAT_TOKEN) throw new Error('LIVECHAT_ACCESS_TOKEN belum diisi');
   const r = await fetch('https://api.livechatinc.com/v3.5/agent/action/send_event', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'authorization': `Bearer ${LIVECHAT_TOKEN}` },
+    headers: { 'content-type': 'application/json', 'authorization': `${LIVECHAT_AUTH_SCHEME} ${LIVECHAT_TOKEN}` },
     body: JSON.stringify({ chat_id: chatId, event: { type: 'message', text, visibility: 'all' } })
   });
   const body = await r.text();
@@ -110,24 +113,37 @@ async function readJson(req) {
 }
 
 function extractLiveChatIncoming(body) {
-  // Handles common webhook shapes: direct payload or wrapped under payload.
-  const p = body.payload || body;
-  const event = p.event || p.chat?.thread?.events?.[p.chat?.thread?.events?.length - 1] || null;
-  const chatId = p.chat_id || p.chat?.id;
-  if (!chatId || !event || event.type !== 'message' || !event.text) return null;
+  const action = body.action || '';
+  const p = body.payload || {};
+  const db = loadDb();
 
-  // Avoid looping agent/bot messages back to Telegram when author type is known.
-  const authorType = event.author?.type || event.author_type || event.user_type || '';
-  if (String(authorType).toLowerCase().includes('agent')) return null;
+  // New chat: cache the customer identity and forward any initial customer messages.
+  if (action === 'incoming_chat' && p.chat?.id) {
+    const chat = p.chat;
+    const customer = (chat.users || []).find(u => String(u.type || '').toLowerCase() === 'customer') || {};
+    const entry = db.chats[chat.id] || {};
+    entry.customerId = customer.id || entry.customerId || '';
+    entry.name = customer.name || customer.email || entry.name || 'Member';
+    entry.issue = entry.issue || '';
+    db.chats[chat.id] = entry;
+    saveDb(db);
 
-  const users = p.chat?.users || [];
-  const customer = users.find(u => String(u.type || '').toLowerCase().includes('customer')) || {};
-  return {
-    chatId,
-    name: customer.name || customer.email || p.customer?.name || 'Member',
-    issue: p.chat?.properties?.routing?.issue || '',
-    text: event.text
-  };
+    const events = chat.thread?.events || [];
+    const evt = [...events].reverse().find(e => e.type === 'message' && e.text && (!entry.customerId || e.author_id === entry.customerId));
+    if (!evt) return null;
+    return { chatId: chat.id, name: entry.name, issue: entry.issue, text: evt.text, customerId: entry.customerId };
+  }
+
+  // Normal subsequent message event.
+  if (action === 'incoming_event' && p.chat_id && p.event?.type === 'message' && p.event?.text) {
+    const entry = db.chats[p.chat_id] || {};
+    // If we know the customer id, only forward customer-authored messages.
+    if (entry.customerId && p.event.author_id && p.event.author_id !== entry.customerId) return null;
+    // If we don't know it yet, allow the event through; incoming_chat should normally arrive first.
+    return { chatId: p.chat_id, name: entry.name || 'Member', issue: entry.issue || '', text: p.event.text, customerId: entry.customerId || p.event.author_id || '' };
+  }
+
+  return null;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -144,7 +160,7 @@ const server = http.createServer(async (req, res) => {
       <form id="f"><input name="name" value="Brow77" placeholder="Nama member"><input name="issue" value="Deposit" placeholder="Kendala"><input name="message" value="Halo kak, tolong cek deposit saya" placeholder="Pesan"><button>Kirim test</button></form>
       <pre id="o"></pre>
       <script>f.onsubmit=async e=>{e.preventDefault();let x=Object.fromEntries(new FormData(f));let r=await fetch('/demo/incoming',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(x)});o.textContent=await r.text()}</script>
-      <h2>Endpoint</h2><pre>POST /demo/incoming\nPOST /telegram/webhook\nPOST /livechat/webhook/${LIVECHAT_WEBHOOK_KEY}\nGET /state</pre>`);
+      <h2>Endpoint</h2><pre>POST /demo/incoming\nPOST /telegram/webhook\nPOST /livechat/webhook\nGET /state</pre>`);
     }
 
     if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, demo: DEMO_MODE });
@@ -177,8 +193,9 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true });
     }
 
-    if (req.method === 'POST' && url.pathname === `/livechat/webhook/${LIVECHAT_WEBHOOK_KEY}`) {
+    if (req.method === 'POST' && (url.pathname === '/livechat/webhook' || url.pathname === `/livechat/webhook/${LIVECHAT_WEBHOOK_KEY}`)) {
       const b = await readJson(req);
+      if (LIVECHAT_WEBHOOK_SECRET && b.secret_key !== LIVECHAT_WEBHOOK_SECRET) return json(res, 403, { ok: false, error: 'invalid livechat webhook secret' });
       const incoming = extractLiveChatIncoming(b);
       if (!incoming) return json(res, 200, { ok: true, ignored: true });
       const result = await forwardCustomerMessage(incoming);
@@ -192,4 +209,19 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Bridge running: http://localhost:${PORT}`));
+async function startup() {
+  if (TG_TOKEN && PUBLIC_BASE_URL) {
+    try {
+      await tg('setWebhook', {
+        url: `${PUBLIC_BASE_URL}/telegram/webhook`,
+        secret_token: TG_SECRET || undefined,
+        allowed_updates: ['message', 'edited_message']
+      });
+      console.log('Telegram webhook configured:', `${PUBLIC_BASE_URL}/telegram/webhook`);
+    } catch (e) {
+      console.error('Telegram webhook setup failed:', e.message);
+    }
+  }
+  server.listen(PORT, '0.0.0.0', () => console.log(`Bridge running: http://0.0.0.0:${PORT}`));
+}
+startup();
