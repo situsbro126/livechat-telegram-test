@@ -1,11 +1,7 @@
 {
-  "name": "livechat-telegram-test-bridge",
-  "version": "0.1.0",
+  "name": "livechat-telegram-simple",
+  "version": "1.0.0",
   "private": true,
-  "description": "MVP test bridge: LiveChat.com <-> Telegram Topics",
-  "scripts": {
-    "start": "node server.js",
-    "setup:telegram": "node setup-telegram.js"
-  },
-  "engines": { "node": ">=18" }
+  "scripts": {"start": "node server.js"},
+  "engines": {"node": ">=18"}
 }
