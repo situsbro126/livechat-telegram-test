@@ -122,13 +122,16 @@ let polling = false;
 let lastPoll = null;
 let lastPollError = null;
 let forwardedCount = 0;
+let visibleChatsCount = 0;
 
 async function pollLiveChat() {
   if (polling || !LIVECHAT_TOKEN || !TG_TOKEN || !TG_GROUP_ID) return;
   polling = true;
   try {
     const data = await lc('list_chats', { filters: { include_active: true } });
-    const chats = Array.isArray(data.chats) ? data.chats : [];
+    const chats = Array.isArray(data.chats_summary) ? data.chats_summary : [];
+    visibleChatsCount = chats.length;
+    console.log(`LiveChat poll: ${chats.length} chat(s) visible to PAT`);
 
     for (const chat of chats) {
       if (!chat?.id) continue;
@@ -182,7 +185,7 @@ const server = http.createServer(async (req, res) => {
       <p>Telegram: <b>${TG_TOKEN && TG_GROUP_ID ? 'configured' : 'belum lengkap'}</b><br>LiveChat PAT: <b>${LIVECHAT_TOKEN ? 'configured' : 'belum diisi'}</b><br>Polling: <b>setiap ${POLL_SECONDS} detik</b></p>
       <p>Last poll: <b>${lastPoll || '-'}</b></p>
       ${lastPollError ? `<p class="err">Error terakhir: ${String(lastPollError).replace(/[<>&]/g, '')}</p>` : ''}
-      <p>Pesan member yang diteruskan: <b>${forwardedCount}</b></p>
+      <p>Chat terlihat oleh PAT: <b>${visibleChatsCount}</b><br>Pesan member yang diteruskan: <b>${forwardedCount}</b></p>
       <h2>Yang dibutuhkan cuma</h2>
       <pre>TELEGRAM_BOT_TOKEN
 TELEGRAM_GROUP_ID
@@ -193,7 +196,7 @@ LIVECHAT_ACCESS_TOKEN</pre>
     }
 
     if (req.method === 'GET' && url.pathname === '/health') {
-      return json(res, 200, { ok: true, lastPoll, lastPollError, forwardedCount });
+      return json(res, 200, { ok: true, lastPoll, lastPollError, visibleChatsCount, forwardedCount });
     }
 
     if (req.method === 'POST' && url.pathname === '/telegram/webhook') {
@@ -220,7 +223,7 @@ LIVECHAT_ACCESS_TOKEN</pre>
 
     if (req.method === 'POST' && url.pathname === '/poll-now') {
       await pollLiveChat();
-      return json(res, 200, { ok: true, lastPoll, lastPollError, forwardedCount });
+      return json(res, 200, { ok: true, lastPoll, lastPollError, visibleChatsCount, forwardedCount });
     }
 
     return json(res, 404, { ok: false, error: 'not found' });
