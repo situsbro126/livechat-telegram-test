@@ -1,24 +1,12 @@
-# LiveChat ↔ Telegram — SIMPLE
+# LiveChat ↔ Telegram — Active Only
 
-Versi ini sengaja tidak memakai LiveChat Developer Console, Client ID, atau LiveChat Webhooks.
+Perbaikan utama:
 
-Cara kerja:
-1. Server mengecek chat aktif LiveChat lewat Agent Chat API setiap beberapa detik.
-2. Pesan customer baru dibuatkan/dikirim ke Telegram Topic.
-3. Balasan operator di Topic Telegram dikirim ke chat LiveChat yang sama melalui `send_event`.
+- Hanya memproses **thread terbaru yang masih active=true**.
+- Tidak membaca seluruh riwayat thread.
+- Pesan yang dibuat sebelum service Render start dianggap historical dan tidak diteruskan.
+- Topic Telegram yang mapping-nya diketahui akan ditutup saat chat sudah tidak aktif.
+- Reply Telegram ke topic yang sudah ditutup tidak akan dikirim ke LiveChat.
 
-Environment Render yang diperlukan:
-- TELEGRAM_BOT_TOKEN
-- TELEGRAM_GROUP_ID
-- PUBLIC_BASE_URL
-- TELEGRAM_WEBHOOK_SECRET
-- LIVECHAT_ACCESS_TOKEN (Base64 Encoded Token dari PAT, scope chats--access:rw)
-- LIVECHAT_POLL_SECONDS=5 (opsional)
-
-Tidak perlu:
-- LIVECHAT_CLIENT_ID
-- LIVECHAT_WEBHOOK_SECRET
-- setup webhook LiveChat
-- Build App
-
-Catatan: Render Free dapat sleep saat tidak ada traffic inbound, jadi untuk tes buka halaman service agar instance tetap bangun.
+Upload/replace `server.js` dan `data.json`, lalu deploy latest commit di Render.
+Environment variable tetap sama; tidak perlu token baru.

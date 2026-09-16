@@ -24,6 +24,10 @@ const LIVECHAT_TOKEN = process.env.LIVECHAT_ACCESS_TOKEN || '';
 const POLL_SECONDS = Math.max(3, Number(process.env.LIVECHAT_POLL_SECONDS || 5));
 const DB_FILE = path.join(__dirname, 'data.json');
 
+// Never replay historical messages after a deploy/restart.
+// A 5-second grace period avoids missing a message sent exactly while Render is booting.
+const BRIDGE_STARTED_MS = Date.now() - 5000;
+
 function loadDb() {
   try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
   catch { return { chats: {}, topics: {}, seenEvents: {} }; }
@@ -44,10 +48,7 @@ async function lc(action, body = {}) {
   if (!LIVECHAT_TOKEN) throw new Error('LIVECHAT_ACCESS_TOKEN belum diisi');
   const r = await fetch(`https://api.livechatinc.com/v3.5/agent/action/${action}`, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'authorization': `Basic ${LIVECHAT_TOKEN}`
-    },
+    headers: { 'content-type': 'application/json', 'authorization': `Basic ${LIVECHAT_TOKEN}` },
     body: JSON.stringify(body)
   });
   const raw = await r.text();
@@ -58,10 +59,7 @@ async function lc(action, body = {}) {
 }
 
 async function lcSend(chatId, text) {
-  return lc('send_event', {
-    chat_id: chatId,
-    event: { type: 'message', text, visibility: 'all' }
-  });
+  return lc('send_event', { chat_id: chatId, event: { type: 'message', text, visibility: 'all' } });
 }
 
 function safeTopicName(name, chatId) {
@@ -69,18 +67,21 @@ function safeTopicName(name, chatId) {
 }
 
 async function ensureTopic(chatId, name) {
-  const db = loadDb();
-  if (db.chats?.[chatId]?.threadId) return db.chats[chatId].threadId;
-
-  const topic = await tg('createForumTopic', {
-    chat_id: TG_GROUP_ID,
-    name: safeTopicName(name, chatId)
-  });
+  let db = loadDb();
+  const existing = db.chats?.[chatId];
+  if (existing?.threadId) {
+    if (existing.closed) {
+      try { await tg('reopenForumTopic', { chat_id: TG_GROUP_ID, message_thread_id: existing.threadId }); } catch {}
+      db = loadDb();
+      if (db.chats?.[chatId]) db.chats[chatId].closed = false;
+      saveDb(db);
+    }
+    return existing.threadId;
+  }
+  const topic = await tg('createForumTopic', { chat_id: TG_GROUP_ID, name: safeTopicName(name, chatId) });
   const threadId = topic.message_thread_id;
-  db.chats ||= {};
-  db.topics ||= {};
-  db.seenEvents ||= {};
-  db.chats[chatId] = { ...(db.chats[chatId] || {}), threadId, name, createdAt: new Date().toISOString() };
+  db.chats ||= {}; db.topics ||= {}; db.seenEvents ||= {};
+  db.chats[chatId] = { threadId, name, createdAt: new Date().toISOString(), closed: false };
   db.topics[String(threadId)] = { chatId };
   saveDb(db);
   return threadId;
@@ -89,9 +90,12 @@ async function ensureTopic(chatId, name) {
 function customerFromChat(chat) {
   return (chat.users || []).find(u => String(u.type || '').toLowerCase() === 'customer') || null;
 }
-
 function eventKey(chatId, event, index) {
   return String(event.id || `${chatId}:${event.created_at || ''}:${event.author_id || ''}:${index}:${event.text || ''}`);
+}
+function createdMs(event) {
+  const n = Date.parse(event?.created_at || '');
+  return Number.isFinite(n) ? n : 0;
 }
 
 async function forwardEvent(chat, customer, event, index) {
@@ -103,12 +107,15 @@ async function forwardEvent(chat, customer, event, index) {
   db.seenEvents ||= {};
   if (db.seenEvents[key]) return false;
 
+  // Important: old messages are marked as seen, but never forwarded.
+  if (createdMs(event) && createdMs(event) < BRIDGE_STARTED_MS) {
+    db.seenEvents[key] = 'historical';
+    saveDb(db);
+    return false;
+  }
+
   const name = customer?.name || customer?.email || 'Member';
   const threadId = await ensureTopic(chat.id, name);
-
-  // Reload database because ensureTopic() may have created and saved a new
-  // Telegram topic. Without this reload, the old in-memory snapshot would
-  // overwrite the topic mapping and create another topic on the next poll.
   db = loadDb();
   db.seenEvents ||= {};
   if (db.seenEvents[key]) return false;
@@ -120,18 +127,28 @@ async function forwardEvent(chat, customer, event, index) {
   });
 
   db.seenEvents[key] = new Date().toISOString();
-  db.chats ||= {};
-  db.chats[chat.id] = {
-    ...(db.chats[chat.id] || {}),
-    threadId,
-    name,
-    customerId: customer?.id || '',
-    lastSeenAt: new Date().toISOString()
-  };
-  db.topics ||= {};
+  db.chats ||= {}; db.topics ||= {};
+  db.chats[chat.id] = { ...(db.chats[chat.id] || {}), threadId, name, customerId: customer?.id || '', lastSeenAt: new Date().toISOString(), closed: false };
   db.topics[String(threadId)] = { chatId: chat.id };
   saveDb(db);
   return true;
+}
+
+async function closeMissingTopics(activeChatIds) {
+  const db = loadDb();
+  let changed = false;
+  for (const [chatId, info] of Object.entries(db.chats || {})) {
+    if (!info?.threadId || info.closed || activeChatIds.has(chatId)) continue;
+    try {
+      await tg('closeForumTopic', { chat_id: TG_GROUP_ID, message_thread_id: info.threadId });
+      info.closed = true;
+      info.closedAt = new Date().toISOString();
+      changed = true;
+    } catch (e) {
+      console.error(`Could not close Telegram topic for ${chatId}:`, e.message);
+    }
+  }
+  if (changed) saveDb(db);
 }
 
 let polling = false;
@@ -139,31 +156,47 @@ let lastPoll = null;
 let lastPollError = null;
 let forwardedCount = 0;
 let visibleChatsCount = 0;
+let activeChatsCount = 0;
+let skippedInactiveCount = 0;
 
 async function pollLiveChat() {
   if (polling || !LIVECHAT_TOKEN || !TG_TOKEN || !TG_GROUP_ID) return;
   polling = true;
   try {
-    const data = await lc('list_chats', { filters: { include_active: true } });
+    // In API v3.5 include_active=true means "include active"; it does NOT mean "only active".
+    // Therefore we verify the newest thread below and process it only when thread.active === true.
+    const data = await lc('list_chats', { filters: { include_active: true }, sort_order: 'desc', limit: 100 });
     const chats = Array.isArray(data.chats_summary) ? data.chats_summary : [];
     visibleChatsCount = chats.length;
-    console.log(`LiveChat poll: ${chats.length} chat(s) visible to PAT`);
+    activeChatsCount = 0;
+    skippedInactiveCount = 0;
+    const activeChatIds = new Set();
 
     for (const chat of chats) {
       if (!chat?.id) continue;
+
+      // Only ask for the newest thread. Never walk old threads/history.
+      const threadsData = await lc('list_threads', { chat_id: chat.id, sort_order: 'desc', limit: 1 });
+      const newest = Array.isArray(threadsData.threads) ? threadsData.threads[0] : null;
+      if (!newest || newest.active !== true) {
+        skippedInactiveCount++;
+        continue;
+      }
+
+      activeChatsCount++;
+      activeChatIds.add(chat.id);
       const customer = customerFromChat(chat);
-      const threadsData = await lc('list_threads', { chat_id: chat.id, sort_order: 'asc', limit: 100 });
-      const threads = Array.isArray(threadsData.threads) ? threadsData.threads : [];
+      const events = Array.isArray(newest.events) ? newest.events : [];
       let idx = 0;
-      for (const thread of threads) {
-        const events = Array.isArray(thread.events) ? thread.events : [];
-        for (const event of events) {
-          if (await forwardEvent(chat, customer, event, idx++)) forwardedCount++;
-        }
+      for (const event of events) {
+        if (await forwardEvent(chat, customer, event, idx++)) forwardedCount++;
       }
     }
+
+    await closeMissingTopics(activeChatIds);
     lastPoll = new Date().toISOString();
     lastPollError = null;
+    console.log(`Poll OK: ${activeChatsCount} active, ${skippedInactiveCount} inactive skipped, ${forwardedCount} forwarded total`);
   } catch (e) {
     lastPollError = e.message;
     console.error('LiveChat polling failed:', e.message);
@@ -194,25 +227,19 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
     if (req.method === 'GET' && url.pathname === '/') {
-      return html(res, `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>LiveChat ↔ Telegram Simple Bridge</title>
+      return html(res, `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>LiveChat ↔ Telegram Active Only</title>
       <style>body{font-family:system-ui;max-width:760px;margin:40px auto;padding:0 18px;line-height:1.5}.ok{color:green}.err{color:#b00}code,pre{background:#f4f4f4;padding:3px 6px;border-radius:6px}pre{padding:14px;overflow:auto}</style>
-      <h1>LiveChat ↔ Telegram Simple Bridge</h1>
+      <h1>LiveChat ↔ Telegram — Active Only</h1>
       <p class="ok">Server aktif.</p>
       <p>Telegram: <b>${TG_TOKEN && TG_GROUP_ID ? 'configured' : 'belum lengkap'}</b><br>LiveChat PAT: <b>${LIVECHAT_TOKEN ? 'configured' : 'belum diisi'}</b><br>Polling: <b>setiap ${POLL_SECONDS} detik</b></p>
       <p>Last poll: <b>${lastPoll || '-'}</b></p>
       ${lastPollError ? `<p class="err">Error terakhir: ${String(lastPollError).replace(/[<>&]/g, '')}</p>` : ''}
-      <p>Chat terlihat oleh PAT: <b>${visibleChatsCount}</b><br>Pesan member yang diteruskan: <b>${forwardedCount}</b></p>
-      <h2>Yang dibutuhkan cuma</h2>
-      <pre>TELEGRAM_BOT_TOKEN
-TELEGRAM_GROUP_ID
-PUBLIC_BASE_URL
-TELEGRAM_WEBHOOK_SECRET
-LIVECHAT_ACCESS_TOKEN</pre>
-      <p>Tidak perlu Client ID, tidak perlu Build App, tidak perlu LiveChat webhook.</p>`);
+      <p>Chat terlihat API: <b>${visibleChatsCount}</b><br><b>Chat aktif diproses: ${activeChatsCount}</b><br>Chat lama/end di-skip: <b>${skippedInactiveCount}</b><br>Pesan baru diteruskan: <b>${forwardedCount}</b></p>
+      <p><b>Proteksi:</b> hanya thread terbaru yang masih aktif, pesan sebelum server start tidak diteruskan, dan topic akan ditutup saat chat selesai.</p>`);
     }
 
     if (req.method === 'GET' && url.pathname === '/health') {
-      return json(res, 200, { ok: true, lastPoll, lastPollError, visibleChatsCount, forwardedCount });
+      return json(res, 200, { ok: true, lastPoll, lastPollError, visibleChatsCount, activeChatsCount, skippedInactiveCount, forwardedCount, bridgeStartedAt: new Date(BRIDGE_STARTED_MS).toISOString() });
     }
 
     if (req.method === 'POST' && url.pathname === '/telegram/webhook') {
@@ -227,19 +254,17 @@ LIVECHAT_ACCESS_TOKEN</pre>
       const db = loadDb();
       const mapped = db.topics?.[String(m.message_thread_id)];
       if (!mapped?.chatId) return json(res, 200, { ok: true, ignored: 'topic not mapped' });
+      const chatInfo = db.chats?.[mapped.chatId];
+      if (chatInfo?.closed) return json(res, 200, { ok: false, error: 'Chat LiveChat sudah selesai; topic ini sudah ditutup.' });
 
       await lcSend(mapped.chatId, m.text);
-      await tg('sendMessage', {
-        chat_id: TG_GROUP_ID,
-        message_thread_id: m.message_thread_id,
-        text: '✅ Terkirim ke LiveChat'
-      });
+      await tg('sendMessage', { chat_id: TG_GROUP_ID, message_thread_id: m.message_thread_id, text: '✅ Terkirim ke LiveChat' });
       return json(res, 200, { ok: true });
     }
 
     if (req.method === 'POST' && url.pathname === '/poll-now') {
       await pollLiveChat();
-      return json(res, 200, { ok: true, lastPoll, lastPollError, visibleChatsCount, forwardedCount });
+      return json(res, 200, { ok: true, lastPoll, lastPollError, visibleChatsCount, activeChatsCount, skippedInactiveCount, forwardedCount });
     }
 
     return json(res, 404, { ok: false, error: 'not found' });
@@ -265,6 +290,7 @@ async function startup() {
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Bridge running: http://0.0.0.0:${PORT}`);
+    console.log(`Historical cutoff: ${new Date(BRIDGE_STARTED_MS).toISOString()}`);
     pollLiveChat();
     setInterval(pollLiveChat, POLL_SECONDS * 1000);
   });
