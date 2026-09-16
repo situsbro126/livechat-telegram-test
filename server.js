@@ -98,13 +98,21 @@ async function forwardEvent(chat, customer, event, index) {
   if (!event || event.type !== 'message' || !event.text) return false;
   if (customer?.id && event.author_id && event.author_id !== customer.id) return false;
 
-  const db = loadDb();
-  db.seenEvents ||= {};
   const key = eventKey(chat.id, event, index);
+  let db = loadDb();
+  db.seenEvents ||= {};
   if (db.seenEvents[key]) return false;
 
   const name = customer?.name || customer?.email || 'Member';
   const threadId = await ensureTopic(chat.id, name);
+
+  // Reload database because ensureTopic() may have created and saved a new
+  // Telegram topic. Without this reload, the old in-memory snapshot would
+  // overwrite the topic mapping and create another topic on the next poll.
+  db = loadDb();
+  db.seenEvents ||= {};
+  if (db.seenEvents[key]) return false;
+
   await tg('sendMessage', {
     chat_id: TG_GROUP_ID,
     message_thread_id: threadId,
@@ -113,7 +121,15 @@ async function forwardEvent(chat, customer, event, index) {
 
   db.seenEvents[key] = new Date().toISOString();
   db.chats ||= {};
-  db.chats[chat.id] = { ...(db.chats[chat.id] || {}), name, customerId: customer?.id || '', lastSeenAt: new Date().toISOString() };
+  db.chats[chat.id] = {
+    ...(db.chats[chat.id] || {}),
+    threadId,
+    name,
+    customerId: customer?.id || '',
+    lastSeenAt: new Date().toISOString()
+  };
+  db.topics ||= {};
+  db.topics[String(threadId)] = { chatId: chat.id };
   saveDb(db);
   return true;
 }
